@@ -1,0 +1,52 @@
+id = "whisper"
+name = "Whisper"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+description = "Observable agent-to-agent messages: log, reply tracking, follow-ups and a live feed"
+platforms = ["linux", "macos"]
+
+# Record where the log lives and catch up on any timeouts after a restart.
+[[startup]]
+command = ["python3", "bin/whisper", "hook"]
+
+# The tracker. Each hook is a short-lived process; state lives in the JSONL log.
+[[events]]
+on = "pane.agent_status_changed"
+command = ["python3", "bin/whisper", "hook"]
+
+[[events]]
+on = "pane.closed"
+command = ["python3", "bin/whisper", "hook"]
+
+[[events]]
+on = "pane.exited"
+command = ["python3", "bin/whisper", "hook"]
+
+[[events]]
+on = "pane.moved"
+command = ["python3", "bin/whisper", "hook"]
+
+# Live view of the conversation.
+[[panes]]
+id = "feed"
+title = "Whisper"
+placement = "split"
+command = ["python3", "bin/whisper", "feed"]
+
+[[actions]]
+id = "feed"
+title = "Whisper: open message feed"
+contexts = ["workspace"]
+command = ["python3", "bin/whisper", "open-feed"]
+
+[[actions]]
+id = "sweep"
+title = "Whisper: check overdue replies now"
+contexts = ["workspace"]
+command = ["python3", "bin/whisper", "sweep"]
+
+[[actions]]
+id = "install-shim"
+title = "Whisper: put `whisper` on PATH for agents"
+contexts = ["workspace"]
+command = ["python3", "bin/whisper", "install-shim"]
