@@ -1,83 +1,58 @@
-# whisper
+# herdr_whisper
 
-A [Herdr](https://herdr.dev) plugin that keeps agent-to-agent conversations
-from going silent.
+A [Herdr](https://herdr.dev) plugin. When one agent prompts another and
+doesn't wait for the answer, whisper makes sure the answer gets back.
 
-Agents keep using Herdr exactly as the Herdr skill teaches
-(`herdr agent prompt reviewer "..."`). Nothing new to learn, no extra skill.
-Most of the time whisper does nothing visible. Its job is to catch the
-"broken telephone" case: agent A asks agent B something, doesn't wait, B
-finishes, and the answer just sits in B's pane where A never sees it.
+## The problem
 
-## How it works
+Agent A runs `herdr agent prompt B "question"` and moves on. B answers in its
+own pane. A never sees the answer.
 
-```
-agent A ── herdr agent prompt B "..." ──▶ herdr shim ──▶ real herdr ──▶ B
-                                            │ logs "A → B"
-                                            ▼
-                                       log.jsonl
-                                            ▲
- B finishes its turn ──▶ pane.agent_status_changed hook ──▶ the loop
-```
+## What whisper does
 
-**1. The shim (silent).** A tiny `herdr` script goes first on `PATH`, but
-only in Herdr panes. For `herdr agent prompt` called from an agent pane, it
-records who prompted whom and whether the sender used `--wait`. Then it runs
-the real herdr with the same arguments and passes its output and exit code
-through unchanged. Every other command goes straight to the real herdr. If
-whisper is broken or missing, the shim gets out of the way.
+1. **Logs prompts.** A small `herdr` shim sits in front of the real `herdr`.
+   When an agent runs `herdr agent prompt`, the shim writes down who sent what
+   to whom, then runs the real command unchanged. Agents don't need to know
+   whisper exists.
 
-**2. The loop (one hook).** Herdr runs `whisper hook` on every agent status
-change. When B returns (idle or done) with a message from A still open,
-whisper first runs plain-code checks:
+2. **Checks when B finishes.** Herdr tells the plugin each time an agent
+   changes state. When B goes idle, whisper checks:
+   - Did A use `--wait`? Then A already has the answer. Done.
+   - Did B prompt A back? Then they are already talking. Done.
+   - Is A a plain shell, not an agent? Nothing to do. Done.
 
-| Situation | Result |
-|---|---|
-| A is not an agent (a human's shell) | `returned`: nothing to push |
-| A used `--wait` and got this turn's result | `returned`: A already has it |
-| B prompted A back during its turn | `replied`: the conversation is moving |
-| otherwise | `judging` |
+3. **Asks an LLM otherwise.** The LLM reads A's message and B's recent output
+   and picks one action:
 
-**3. The judge (semantic).** Only in the last case does an LLM read A's
-message and B's recent output, and decide whether the exchange was meant to
-end there:
+   | Action | What happens |
+   |---|---|
+   | `close` | The conversation is finished. Nothing is sent. |
+   | `forward` | B's answer is sent to A. |
+   | `resend` | B never handled the message. It is sent to B again. |
+   | `nudge` | B stopped halfway. B is asked to continue. |
+   | `human` | You get a Herdr notification. |
 
-| Judge says | Whisper does |
-|---|---|
-| `close`: the exchange was meant to end (FYI, done) | nothing (`closed`) |
-| `forward`: B has something A needs | prompts A with B's answer (`forwarded`) |
-| `resend`: B never handled the message | prompts B with the message again (`resent`), then watches the next turn |
-| `nudge`: B stopped halfway or asked to continue | prompts B to continue (`nudged`), then watches the next turn |
-| `human`: only you can sort it out | Herdr notification (`escalated`) |
+Everything whisper sends starts with `[whisper]` and goes through the real
+`herdr agent prompt`, so Herdr's normal checks still apply.
 
-The judge only decides. Whisper does the sending itself, through the real
-`herdr agent prompt`, so Herdr's `agent_blocked` check still applies. Every
-push is labelled `[whisper]`. Hard limits turn any runaway into a
-notification: at most `max_pushes` resends or nudges per message, and at most
-`max_forwards_per_pair_per_hour` forwards between two agents.
+Limits stop endless loops: at most 2 resends or nudges per message, and at
+most 12 forwards per hour between the same two agents. After that, you get a
+notification instead.
 
-A forward looks like this in A's pane:
-
-```
-[whisper] reviewer@w1:p3 finished the message you sent at 14:02 ("Is migration 0042 safe to run twice?"):
-reviewer answered: yes, 0042 is safe to run twice; both statements are idempotent.
-(full output: herdr agent read w1:p3 --source recent-unwrapped --lines 200)
-```
-
-You also get a notification when B gets blocked on an approval, B's pane
-closes mid-conversation, B never picks the message up, a push fails, or the
-judge can't decide.
+You also get a notification when B is waiting on an approval, B's pane closes,
+B never starts on the message, or the LLM can't be reached.
 
 ## Install
 
 ```bash
-herdr plugin link /path/to/herdr-whisper      # or: herdr plugin install <owner>/<repo>
-herdr plugin action invoke whisper.install    # shim + `whisper` command + one PATH line in ~/.bashrc / ~/.zshrc
+herdr plugin install taituo/herdr_whisper
+herdr plugin action invoke whisper.install
 ```
 
-Open new panes, or restart agents in existing ones, so they pick up the shim.
-
-The PATH line only applies inside Herdr (`HERDR_ENV=1`):
+The second command:
+- writes the shim to `~/.local/share/herdr-whisper/bin/herdr`
+- writes a `whisper` command to `~/.local/bin/whisper`
+- adds these lines to `~/.bashrc` (and `~/.zshrc` if you have one):
 
 ```sh
 # >>> herdr-whisper >>>
@@ -85,109 +60,82 @@ The PATH line only applies inside Herdr (`HERDR_ENV=1`):
 # <<< herdr-whisper <<<
 ```
 
-If you'd rather add it yourself, run `whisper install` without `--rc`.
-`whisper uninstall` removes everything again. For fish, add
-`~/.local/share/herdr-whisper/bin` to `fish_user_paths` when `HERDR_ENV` is 1.
+They put the shim first on `PATH`, but only inside Herdr panes (`HERDR_ENV=1`). Open new panes, or restart
+agents in old ones, to pick it up.
 
-You need Python 3.9+ (stdlib only), Linux or macOS, and an LLM CLI for the
-judge. By default that's Claude Code (`claude -p --model haiku`).
+To add the line yourself instead, run `whisper install` (no `--rc`).
+To remove everything: `whisper uninstall`.
 
-## Watching
+You need Python 3.9+, Linux or macOS, and an LLM command line tool. The
+default is Claude Code (`claude -p --model haiku`).
+
+## Commands
 
 ```bash
-whisper feed            # live view; also the plugin pane (action whisper.feed)
-whisper status [--all]  # open conversations plus anything that needs you
-whisper show <id>       # one message: history, judge verdict, pushed text
-whisper log [-f|--raw]  # history, follow, or raw JSONL
-whisper judge <id>      # dry-run the judge on a message (--prompt prints the prompt)
-whisper where           # paths, judge command, push on/off
+whisper status          # open conversations, and anything that needs you
+whisper status --all    # everything
+whisper feed            # live view (also opens as a Herdr pane: whisper.feed)
+whisper show <id>       # one message, its history, and the LLM's decision
+whisper log -f          # follow new events
+whisper judge <id>      # ask the LLM about a message without acting
+whisper where           # file locations and current settings
 ```
 
+Example `whisper status --all`:
+
 ```
-14:09:37 73a3be   forwarded  planner@w1:p2 → ignorebot@w1:p5  q-ignored
-14:09:34 9c2e05   replied    planner@w1:p2 → callbackbot@w1:p4  please ask back
-14:09:29 a3e91c w returned   planner@w1:p2 → answerbot@w1:p3  q-wait
+14:09:37 73a3be   forwarded  planner@w1:p2 → tester@w1:p5    run the auth tests
+14:09:34 9c2e05   replied    planner@w1:p2 → reviewer@w1:p4  review the diff
+14:09:29 a3e91c w returned   planner@w1:p2 → coder@w1:p3     fix the build
 ```
 
-Optional keybinding (`~/.config/herdr/config.toml`):
+`w` means the sender used `--wait`.
+
+## Settings
+
+File: `~/.config/herdr/plugins/config/whisper/config.toml`
 
 ```toml
-[[keys.command]]
-key = "prefix+w"
-type = "plugin_action"
-command = "whisper.feed"
-description = "whisper feed"
-```
-
-## Config
-
-`~/.config/herdr/plugins/config/whisper/config.toml`:
-
-```toml
-push = true                                   # false = dry run: judge and notify, never type into an agent
+push = true             # false: decide and notify, but never send anything
 notify = true
-judge_command = ["claude", "-p", "--model", "haiku"]   # any command: prompt on stdin, answer on stdout
+judge_command = ["claude", "-p", "--model", "haiku"]
 judge_timeout_s = 120
-max_pushes = 2                                # resends + nudges per message, then you get it
-max_forwards_per_pair_per_hour = 12           # loop guard
-settle_grace_s = 20                           # see "busy recipient" below
-start_timeout_s = 120                         # delivered but never started → notification
-work_timeout_s = 1800                         # still working → one notification
-read_lines = 150                              # lines of B's output the judge sees
+max_pushes = 2          # resends + nudges per message
+max_forwards_per_pair_per_hour = 12
+settle_grace_s = 20
+start_timeout_s = 120   # notify if B hasn't started after this
+work_timeout_s = 1800   # notify once if B is still working after this
+read_lines = 150        # how much of B's output the LLM sees
 ```
 
-Other judges work if they read stdin and print the JSON verdict, for example
-`["codex", "exec", "-"]`, `["llm", "-m", "gpt-4o-mini"]` or
-`["ollama", "run", "llama3.1"]`.
+Start with `push = false` if you want to see the decisions before whisper
+sends anything.
 
-## State
+Any LLM tool works if it reads the prompt from stdin and prints the answer,
+for example `["codex", "exec", "-"]` or `["ollama", "run", "llama3.1"]`.
 
-There is one append-only `log.jsonl` per Herdr server, under
-`~/.local/state/herdr/plugins/whisper/sessions/<id>/`. It holds one line per
-message, state change and verdict, written under a file lock and fsynced.
-`snapshot.json` is only a cache: delete it and it rebuilds from the log. There
-is no daemon. The checks that depend on time run on every hook, every CLI
-call, every 5 s while the feed is open, and at server startup.
+## Where data is kept
 
-## Limits and trade-offs
+`~/.local/state/herdr/plugins/whisper/sessions/<id>/log.jsonl`
 
-- **The shim only sees what goes through it.** That covers `herdr agent prompt`
-  run from an agent pane through `PATH`, which is what the Herdr skill
-  teaches. Calls with an absolute path to the real binary, `--machine`
-  (remote) calls, and raw `pane send-text` are passed through untracked.
-- **Sender identity is claimed, not proven.** It comes from `HERDR_PANE_ID`.
-- **The judge reads terminal output.** That output is untrusted: an agent's
-  pane could contain text aimed at the judge. The prompt tells the judge to
-  treat it as data. Whisper only accepts the five actions, caps the message
-  length, labels every push, and enforces the limits above. Use
-  `push = false` if you want to watch verdicts before letting it act.
-- **Busy recipient.** If B was already working when the prompt arrived,
-  whisper waits for B to go through a working → idle turn of its own. If B
-  folded the message into the turn it was already in, whisper judges after
-  `settle_grace_s`.
-- **`agent prompt` only reaches agents Herdr recognises.** That's Herdr's own
-  rule, and whisper doesn't change it.
+One line per event, append only. `snapshot.json` next to it is a cache and
+can be deleted.
+
+## Limits
+
+- Only `herdr agent prompt` run from an agent pane is seen. Remote
+  (`--machine`) calls, `pane send-text`, and calls to the real binary by full
+  path are not tracked.
+- The sender is whatever `HERDR_PANE_ID` says. It is not verified.
+- The LLM reads terminal output, which could contain text meant to trick it.
+  Whisper only accepts the five actions, labels what it sends, and keeps the
+  limits above.
+- If B was already busy when the message arrived, whisper waits up to
+  `settle_grace_s` for B to start a new turn before deciding.
 
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -p 'test_*.py'   # loop logic, no Herdr or LLM needed
-python3 tests/e2e_herdr.py /path/to/herdr              # real Herdr server, fake agents, fake judge (~1 min)
+python3 -m unittest discover -s tests -p 'test_*.py'   # no Herdr needed
+python3 tests/e2e_herdr.py /path/to/herdr              # real Herdr, fake agents, ~1 min
 ```
-
-The end-to-end run uses Herdr 0.9.4. It installs the shim through the plugin
-action and checks:
-
-- the shim passes output and errors through byte for byte
-- `--wait` → `returned`
-- no wait → `forwarded`
-- B prompts back → `replied`
-- B ignores the message → `resent` → `forwarded`
-- FYI → `closed`
-- blocked recipient, with `agent_blocked` still enforced
-- a shell as sender
-- a busy recipient
-- a missing judge → `escalated`
-- dry run
-- pane closed → `orphaned`
-- the feed, rebuilding the log, hook exit codes, and uninstall
