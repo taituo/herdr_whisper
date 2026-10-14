@@ -23,8 +23,14 @@ PLUGIN_ID = "whisper"
 SCHEMA_V = 1
 
 # States a message is still being tracked in.
-OPEN_STATES = {"queued", "delivered", "working", "blocked", "nudged", "stalled"}
-FINAL_STATES = {"done", "replied", "unanswered", "failed", "orphaned", "acked", "rejected"}
+OPEN_STATES = {"queued", "delivered", "working", "blocked", "stalled", "judging", "resent", "nudged"}
+# returned:  the sender was waiting (`--wait`) and got the turn result itself
+# replied:   the recipient prompted the sender back during its turn
+# forwarded: whisper pushed the recipient's answer to the sender
+# closed:    the judge decided the exchange was meant to end here
+# escalated: handed to the human (judge said so, push limit, judge failure)
+FINAL_STATES = {"returned", "replied", "forwarded", "closed", "escalated",
+                "failed", "orphaned"}
 
 
 # --- locations ---------------------------------------------------------------
@@ -73,24 +79,27 @@ def session_dir() -> Path:
 # --- config ------------------------------------------------------------------
 
 DEFAULT_CONFIG = {
-    # observe: track, log, notify the human. active: also nudge recipients
-    # that settle without replying, and ask senders to ack/reject replies.
-    "mode": "observe",
+    # true: act on the judge's decision (forward / resend / nudge).
+    # false: dry run - judge, log and notify, never type into an agent.
+    "push": True,
     "notify": True,
-    "max_nudges": 1,
-    # If the recipient was already busy when the message arrived, its first
-    # settle may belong to the previous turn. Wait this long for a second turn
-    # before judging.
+    # Any command that reads a prompt on stdin and prints an answer.
+    "judge_command": ["claude", "-p", "--model", "haiku"],
+    "judge_timeout_s": 120,
+    # Resends + nudges to the same recipient for one message before the
+    # human gets it instead.
+    "max_pushes": 2,
+    # Runaway guard: forwards between the same two agents per hour.
+    "max_forwards_per_pair_per_hour": 12,
+    # Recipient was busy when the prompt arrived: wait this long for a turn of
+    # its own before judging what it has.
     "settle_grace_s": 20,
-    # Delivered but recipient never started working.
+    # Delivered but the recipient never started working.
     "start_timeout_s": 120,
-    # Working for longer than this with a reply outstanding -> "stalled" notice.
+    # Long-running notice.
     "work_timeout_s": 1800,
-    # When `herdr agent prompt` cannot address the recipient (agent_not_ready),
-    # fall back to `herdr pane run`. Still refuses blocked recipients.
-    "raw_fallback": False,
-    # How many lines of the sender's pane to scan for a raw `re:<id>` reply.
-    "scan_lines": 400,
+    # Lines of the recipient's output the judge sees.
+    "read_lines": 150,
 }
 
 
@@ -99,9 +108,6 @@ def load_config() -> dict:
     path = config_root() / "config.toml"
     if path.exists():
         cfg.update(_parse_toml(path.read_text()))
-    for key, env in (("mode", "WHISPER_MODE"),):
-        if os.environ.get(env):
-            cfg[key] = os.environ[env]
     return cfg
 
 
@@ -119,6 +125,8 @@ def _parse_toml(text: str) -> dict:
         key, value = (part.strip() for part in line.split("=", 1))
         if value in ("true", "false"):
             out[key] = value == "true"
+        elif value.startswith("["):
+            out[key] = json.loads(value)
         elif value.lstrip("-").isdigit():
             out[key] = int(value)
         else:
@@ -218,13 +226,10 @@ def fold(messages: dict, rec: dict) -> None:
     kind = rec.get("t")
     mid = rec.get("id")
     if kind == "msg":
-        m = {k: rec.get(k) for k in ("id", "ts", "from", "to", "text", "expect_reply", "re", "via")}
-        m.update(state="queued", history=[[rec["ts"], "queued", ""]], replies=[],
-                 nudges=0, notices=[], updated=rec["ts"], verdict=None)
+        m = {k: rec.get(k) for k in ("id", "ts", "from", "to", "text", "wait", "via")}
+        m.update(state="queued", history=[[rec["ts"], "queued", ""]], pushes=0,
+                 notices=[], updated=rec["ts"], wait_result=None, verdict=None)
         messages[mid] = m
-        parent = messages.get(rec.get("re") or "")
-        if parent is not None and mid not in parent["replies"]:
-            parent["replies"].append(mid)
         return
     m = messages.get(mid)
     if m is None:
@@ -233,13 +238,15 @@ def fold(messages: dict, rec: dict) -> None:
         m["state"] = rec["state"]
         m["updated"] = rec["ts"]
         m["history"].append([rec["ts"], rec["state"], rec.get("detail", "")])
-        if rec["state"] == "nudged":
-            m["nudges"] += 1
+        if rec["state"] in ("resent", "nudged"):
+            m["pushes"] += 1
+    elif kind == "wait":
+        m["wait_result"] = rec.get("result")
+    elif kind == "verdict":
+        m["verdict"] = {k: rec.get(k) for k in ("action", "message", "reason")}
     elif kind == "notice":
-        m.setdefault("notices", []).append([rec["ts"], rec.get("detail", "")])
+        m["notices"].append([rec["ts"], rec.get("detail", "")])
     elif kind == "remap":
         side = rec.get("side", "to")
         if isinstance(m.get(side), dict):
             m[side]["pane"] = rec.get("pane")
-    elif kind == "verdict":
-        m["verdict"] = {"ok": rec.get("ok"), "note": rec.get("note", ""), "ts": rec["ts"]}

@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
-"""Entry point. Works from the plugin root (Herdr hooks), a symlink, or a shim."""
+"""Entry point. Works from the plugin root (Herdr hooks), the launcher, or the shim."""
 import os
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 sys.path.insert(0, ROOT)
 
-from whisper_lib.cli import main  # noqa: E402
+try:
+    from whisper_lib.cli import main
+except Exception:
+    # Called by the herdr shim: a broken whisper must never break herdr.
+    if len(sys.argv) > 2 and sys.argv[1] == "tap":
+        os.execv(sys.argv[2], [sys.argv[2], *sys.argv[3:]])
+    raise
 
 if __name__ == "__main__":
     sys.exit(main())

@@ -1,58 +1,78 @@
 #!/usr/bin/env python3
-"""Fake coding agent (install it as an executable named `claude`) for testing whisper inside a real Herdr pane.
+"""Fake coding agent for the end-to-end test. Install it as an executable
+named `claude`: Herdr only lets `agent prompt` address agents it recognises.
 
-Reports lifecycle state through `herdr pane report-agent`, reads submitted
-prompts from stdin, and reacts according to FAKE_MODE:
-  reply  - answer any whisper message that asks for a reply (via `whisper reply`)
-  raw    - answer with a raw `herdr agent prompt` containing re:<id>
-  silent - do the work, never reply
-  block  - go to `blocked` on the next prompt and stay there
-  echo   - just work and settle
+It reports lifecycle state with `herdr pane report-agent`, treats lines that
+arrive together as one prompt (like a paste), and behaves per FAKE_MODE:
+  answer   - prints "ANSWER from <name>: 42"
+  callback - prompts the pane named in the prompt back via `herdr agent prompt`
+  ignore   - ignores a prompt unless it is a whisper resend, then answers
+  block    - goes to `blocked` and stays there
+  silent   - prints "ok." (acknowledges without content)
 """
 import os
 import re
+import select
 import subprocess
 import sys
 import time
 
-HERDR = os.environ.get("HERDR_BIN_PATH", "herdr")
+REAL = os.environ.get("FAKE_REAL_HERDR", "herdr")  # status reports bypass the shim
 PANE = os.environ["HERDR_PANE_ID"]
 NAME = os.environ.get("FAKE_NAME", "fake")
-MODE = os.environ.get("FAKE_MODE", "echo")
-WORK = float(os.environ.get("FAKE_WORK_S", "1.5"))
+MODE = os.environ.get("FAKE_MODE", "answer")
+WORK = float(os.environ.get("FAKE_WORK_S", "1"))
 seq = 0
 
 
 def report(state):
     global seq
     seq = max(seq + 1, int(time.time() * 1000))
-    subprocess.run([HERDR, "pane", "report-agent", PANE, "--source", "custom:fake",
+    subprocess.run([REAL, "pane", "report-agent", PANE, "--source", "custom:fake",
                     "--agent", "claude", "--state", state, "--seq", str(seq)],
                    capture_output=True)
 
 
+def read_prompt():
+    line = sys.stdin.readline()
+    if not line:
+        return None
+    parts = [line.rstrip("\n")]
+    while select.select([sys.stdin], [], [], 0.3)[0]:
+        more = sys.stdin.readline()
+        if not more:
+            break
+        parts.append(more.rstrip("\n"))
+    return "\n".join(parts).strip()
+
+
 report("idle")
 print(f"[{NAME}] ready ({MODE})", flush=True)
-for line in sys.stdin:
-    line = line.strip()
-    if not line:
+while True:
+    prompt = read_prompt()
+    if prompt is None:
+        break
+    if not prompt:
         continue
-    print(f"[{NAME}] got: {line}", flush=True)
+    print(f"[{NAME}] got: {prompt}", flush=True)
     if MODE == "block":
         report("blocked")
         print(f"[{NAME}] Allow this? (y/n)", flush=True)
         continue
     report("working")
     time.sleep(WORK)
-    m = re.search(r"msg:([0-9a-f]{6}).*?reply expected", line)
-    if m and MODE == "reply":
-        r = subprocess.run(["whisper", "reply", m.group(1), f"{NAME} says: done, 42"],
-                           capture_output=True, text=True)
-        print(f"[{NAME}] whisper reply -> {r.returncode} {r.stdout.strip()} {r.stderr.strip()}", flush=True)
-    elif m and MODE == "raw":
-        sender = re.search(r"from \S*?\(?(w\d+:p\d+)\)?", line)
-        if sender:
-            subprocess.run([HERDR, "agent", "prompt", sender.group(1),
-                            f"raw answer re:{m.group(1)} it is 42"], capture_output=True)
+    if MODE == "answer" or (MODE == "ignore" and "Resending" in prompt):
+        print(f"ANSWER from {NAME}: 42", flush=True)
+    elif MODE == "ignore":
+        print(f"IGNORED: {NAME} is busy with other work", flush=True)
+    elif MODE == "callback":
+        target = re.search(r"ask back (w\d+:p\d+)", prompt)
+        if target:
+            # Through PATH, i.e. through the whisper shim, like a real agent.
+            r = subprocess.run(["herdr", "agent", "prompt", target.group(1),
+                                f"callback from {NAME}: 42"], capture_output=True, text=True)
+            print(f"[{NAME}] prompted back: rc={r.returncode}", flush=True)
+    else:
+        print("ok.", flush=True)
     report("idle")
     print(f"[{NAME}] idle", flush=True)

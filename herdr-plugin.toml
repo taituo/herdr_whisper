@@ -1,15 +1,16 @@
 id = "whisper"
 name = "Whisper"
-version = "0.1.0"
+version = "0.2.0"
 min_herdr_version = "0.9.0"
-description = "Observable agent-to-agent messages: log, reply tracking, follow-ups and a live feed"
+description = "Keeps agent-to-agent conversations from silently dying: logs herdr agent prompts, and when an agent returns an LLM decides whether to forward, resend, nudge or call you"
 platforms = ["linux", "macos"]
 
-# Record where the log lives and catch up on any timeouts after a restart.
+# Catch up on timeouts after a restart.
 [[startup]]
 command = ["python3", "bin/whisper", "hook"]
 
-# The tracker. Each hook is a short-lived process; state lives in the JSONL log.
+# The loop. Each agent status change spawns one short-lived hook process;
+# state lives in the JSONL log, so there is no daemon.
 [[events]]
 on = "pane.agent_status_changed"
 command = ["python3", "bin/whisper", "hook"]
@@ -46,7 +47,7 @@ contexts = ["workspace"]
 command = ["python3", "bin/whisper", "sweep"]
 
 [[actions]]
-id = "install-shim"
-title = "Whisper: put `whisper` on PATH for agents"
+id = "install"
+title = "Whisper: install the herdr shim (adds one PATH line to ~/.bashrc / ~/.zshrc)"
 contexts = ["workspace"]
-command = ["python3", "bin/whisper", "install-shim"]
+command = ["python3", "bin/whisper", "install", "--rc"]
